@@ -27,3 +27,21 @@ LANGUAGE C STRICT PARALLEL RESTRICTED;
 -- We don't want this to be available to public
 REVOKE ALL ON FUNCTION bt_index_parent_check(regclass, boolean, boolean, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION bt_index_check(regclass, boolean, boolean) FROM PUBLIC;
+
+CREATE FUNCTION bt_index_bloat_stats(index regclass)
+RETURNS TABLE (
+    total_pages         int8,
+    leaf_pages          int8,
+    internal_pages      int8,
+    deleted_pages       int8,
+    free_pages          int8,
+    leaf_free_space     int8,
+    leaf_used_space     int8,
+    internal_free_space int8,
+    internal_used_space int8,
+    total_free_space    int8,
+    total_used_space    int8,
+    bloat_ratio         numeric
+)
+AS 'MODULE_PATHNAME', 'bt_index_bloat_stats'
+LANGUAGE C STRICT PARALLEL SAFE;

@@ -35,12 +35,26 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_opfamily_d.h"
 #include "common/pg_prng.h"
+#include "funcapi.h"
 #include "lib/bloomfilter.h"
 #include "miscadmin.h"
 #include "storage/smgr.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
+
+#include "funcapi.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
+#include "utils/numeric.h"
+#include "catalog/pg_am_d.h"
+#include "storage/bufmgr.h"
+#include "access/htup_details.h"   /* HeapTupleGetDatum */
+#include "funcapi.h"               /* get_call_result_type, BlessTupleDesc, TYPEFUNC_COMPOSITE */
+#include <math.h>                  /* rint */
 
 
 PG_MODULE_MAGIC_EXT(
@@ -173,8 +187,25 @@ typedef struct BTCallbackState
 	bool		checkunique;
 } BTCallbackState;
 
+typedef struct BtreeBloatState
+{
+	BlockNumber total_pages;
+	BlockNumber leaf_pages;
+	BlockNumber internal_pages;
+	BlockNumber deleted_pages;
+	BlockNumber free_pages;
+	int64		leaf_free_space;
+	int64		leaf_used_space;
+	int64		internal_free_space;
+	int64		internal_used_space;
+	int64		total_free_space;
+	int64		total_used_space;
+	BufferAccessStrategy checkstrategy;
+} BtreeBloatState;
+
 PG_FUNCTION_INFO_V1(bt_index_check);
 PG_FUNCTION_INFO_V1(bt_index_parent_check);
+PG_FUNCTION_INFO_V1(bt_index_bloat_stats);
 
 static void bt_index_check_callback(Relation indrel, Relation heaprel,
 									void *state, bool readonly);
@@ -238,6 +269,11 @@ static ItemId PageGetItemIdCareful(BtreeCheckState *state, BlockNumber block,
 static inline ItemPointer BTreeTupleGetHeapTIDCareful(BtreeCheckState *state,
 													  IndexTuple itup, bool nonpivot);
 static inline ItemPointer BTreeTupleGetPointsToTID(IndexTuple itup);
+static void bt_analyze_page_bloat(Page page, BlockNumber blkno,
+								  BtreeBloatState *stats);
+static void bt_calculate_bloat_stats(Relation rel, BtreeBloatState *bloat_state);
+
+Datum		bt_index_bloat_stats(PG_FUNCTION_ARGS);
 
 /*
  * bt_index_check(index regclass, heapallindexed boolean, checkunique boolean)
@@ -3588,4 +3624,155 @@ BTreeTupleGetPointsToTID(IndexTuple itup)
 
 	/* Pivot tuple returns TID with downlink block (heapkeyspace variant) */
 	return &itup->t_tid;
+}
+
+static void
+bt_analyze_page_bloat(Page page, BlockNumber blkno, BtreeBloatState *stats)
+{
+	Size		free_size;
+	Size		used_size;
+	BTPageOpaque opaque;
+
+	(void) blkno;
+
+	if (stats == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("bloat stats state must not be null")));
+
+	free_size = PageGetFreeSpace(page);
+	used_size = BLCKSZ - free_size;
+
+	stats->total_pages++;
+	stats->total_free_space += (int64) free_size;
+	stats->total_used_space += (int64) used_size;
+
+	if (PageIsNew(page))
+	{
+		stats->free_pages++;
+		return;
+	}
+
+	opaque = BTPageGetOpaque(page);
+
+	if (P_ISDELETED(opaque))
+	{
+		stats->deleted_pages++;
+		return;
+	}
+
+	if (P_ISLEAF(opaque))
+	{
+		stats->leaf_pages++;
+		stats->leaf_free_space += (int64) free_size;
+		stats->leaf_used_space += (int64) used_size;
+	}
+	else
+	{
+		stats->internal_pages++;
+		stats->internal_free_space += (int64) free_size;
+		stats->internal_used_space += (int64) used_size;
+	}
+}
+
+static void
+bt_calculate_bloat_stats(Relation rel, BtreeBloatState *bloat_state)
+{
+	BlockNumber total_blocks;
+	BlockNumber blkno;
+
+	if (bloat_state == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("bloat stats state must not be null")));
+
+	total_blocks = RelationGetNumberOfBlocks(rel);
+	if (total_blocks == 0)
+		return;
+
+	for (blkno = BTREE_METAPAGE + 1; blkno < total_blocks; blkno++)
+	{
+		Buffer		buffer;
+		Page		page;
+
+		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									bloat_state->checkstrategy);
+		LockBuffer(buffer, BT_READ);
+		page = BufferGetPage(buffer);
+
+		if (!PageIsNew(page))
+			_bt_checkpage(rel, buffer);
+
+		bt_analyze_page_bloat(page, blkno, bloat_state);
+
+		UnlockReleaseBuffer(buffer);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+Datum
+bt_index_bloat_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	BtreeBloatState *bloat_state;
+	Datum		values[12];
+	bool		nulls[12] = {false};
+	double		ratio;
+	Datum		ratio_numeric;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	rel = index_open(relid, AccessShareLock);
+
+	if (rel->rd_rel->relkind != RELKIND_INDEX ||
+		rel->rd_rel->relam != BTREE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a btree index",
+						RelationGetRelationName(rel))));
+
+	bloat_state = palloc0(sizeof(BtreeBloatState));
+	bloat_state->checkstrategy = GetAccessStrategy(BAS_BULKREAD);
+
+	bt_calculate_bloat_stats(rel, bloat_state);
+	index_close(rel, AccessShareLock);
+
+	values[0] = Int64GetDatum((int64) bloat_state->total_pages);
+	values[1] = Int64GetDatum((int64) bloat_state->leaf_pages);
+	values[2] = Int64GetDatum((int64) bloat_state->internal_pages);
+	values[3] = Int64GetDatum((int64) bloat_state->deleted_pages);
+	values[4] = Int64GetDatum((int64) bloat_state->free_pages);
+	values[5] = Int64GetDatum(bloat_state->leaf_free_space);
+	values[6] = Int64GetDatum(bloat_state->leaf_used_space);
+	values[7] = Int64GetDatum(bloat_state->internal_free_space);
+	values[8] = Int64GetDatum(bloat_state->internal_used_space);
+	values[9] = Int64GetDatum(bloat_state->total_free_space);
+	values[10] = Int64GetDatum(bloat_state->total_used_space);
+
+	if (bloat_state->total_pages > 0)
+		ratio = rint((((double) bloat_state->total_free_space * 100.0) /
+					  ((double) bloat_state->total_pages * (double) BLCKSZ)) * 100.0) / 100.0;
+	else
+		ratio = 0.0;
+
+	ratio_numeric = DirectFunctionCall1(float8_numeric, Float8GetDatum(ratio));
+	values[11] = DirectFunctionCall2(numeric_round,
+									 ratio_numeric,
+									 Int32GetDatum(2));
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	PG_RETURN_NULL();
 }
